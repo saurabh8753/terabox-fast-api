@@ -1,0 +1,8 @@
+{
+  "routes": [
+    {
+      "src": "/api/terabox",
+      "dest": "/api/terabox.js"
+    }
+  ]
+}
