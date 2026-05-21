@@ -1,9 +1,6 @@
 {
-  "name": "terabox-fast-api",
+  "name": "terabox-api",
   "version": "1.0.0",
-  "description": "TeraBox API using seiya-npm/terabox-api",
-  "main": "api/terabox.js",
-  "type": "commonjs",
   "dependencies": {
     "terabox-api": "^1.0.0"
   }
