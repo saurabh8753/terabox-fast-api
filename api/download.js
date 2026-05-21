@@ -1,98 +1,94 @@
-const TERABOX_DOMAINS = [
-  "terabox.com",
-  "www.terabox.com",
-  "teraboxapp.com",
-  "www.teraboxapp.com",
-  "1024tera.com",
-  "www.1024tera.com",
-  "nephobox.com",
-  "www.nephobox.com",
-  "4funbox.com",
-  "www.4funbox.com"
-];
-
-function extractShorturl(inputUrl) {
-  const url = new URL(inputUrl);
-
-  if (!TERABOX_DOMAINS.includes(url.hostname)) {
-    throw new Error("Unsupported TeraBox domain");
-  }
-
-  const pathMatch = url.pathname.match(/\/s\/([^/?]+)/);
-  if (pathMatch) return pathMatch[1];
-
-  const surl = url.searchParams.get("surl");
-  if (surl) return surl;
-
-  throw new Error("Could not extract shorturl");
-}
-
-async function getTeraBoxData(inputUrl) {
-  const shorturl = extractShorturl(inputUrl);
-
-  const apiUrl =
-    `https://www.terabox.com/share/list?app_id=250528&shorturl=${encodeURIComponent(shorturl)}&root=1`;
-
-  const response = await fetch(apiUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      "Accept": "application/json"
-    }
-  });
-
-  const data = await response.json();
-
-  if (!data.list || !Array.isArray(data.list)) {
-    throw new Error("No files found");
-  }
-
-  const files = data.list.map(file => ({
-    name: file.server_filename,
-    size: file.size,
-    category: file.category,
-    fs_id: file.fs_id,
-    is_dir: file.isdir === 1,
-    thumbnail: file.thumb || file.image || null,
-    download: file.dlink || null
-  }));
-
-  return {
-    shorturl,
-    count: files.length,
-    files
-  };
-}
-
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
 
   try {
     const { url } = req.query;
 
     if (!url) {
-      return res.status(200).json({
+      return res.json({
         success: true,
-        message: "TeraBox API is working.",
-        usage: "/api/download?url=https://terabox.com/s/xxxxxxxx"
+        message: "API working",
+        usage: "/api/download?url=https://terabox.com/s/xxxx"
       });
     }
 
-    const result = await getTeraBoxData(url);
-
-    return res.status(200).json({
-      success: true,
-      ...result
+    // 1. Fetch share page HTML
+    const htmlRes = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0"
+      }
     });
-  } catch (error) {
+
+    const html = await htmlRes.text();
+
+    // 2. Extract shorturl
+    const shortMatch = url.match(/\/s\/([^/?]+)/);
+    if (!shortMatch) {
+      throw new Error("Short URL not found");
+    }
+
+    const shorturl = shortMatch[1];
+
+    // 3. Extract jsToken
+    const jsTokenMatch = html.match(/"jsToken":"(.*?)"/);
+    const jsToken = jsTokenMatch ? jsTokenMatch[1] : "";
+
+    // 4. Extract uk
+    const ukMatch = html.match(/"uk":(\d+)/);
+    const uk = ukMatch ? ukMatch[1] : "";
+
+    // 5. Extract shareid
+    const shareidMatch = html.match(/"shareid":(\d+)/);
+    const shareid = shareidMatch ? shareidMatch[1] : "";
+
+    // 6. Call share/list
+    const apiUrl =
+      `https://www.terabox.com/share/list?app_id=250528` +
+      `&shorturl=${shorturl}` +
+      `&root=1` +
+      `&jsToken=${jsToken}` +
+      `&uk=${uk}` +
+      `&shareid=${shareid}`;
+
+    const apiRes = await fetch(apiUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+      }
+    });
+
+    const data = await apiRes.json();
+
+    if (!data.list || data.list.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "No files found",
+        debug: {
+          shorturl,
+          uk,
+          shareid,
+          jsToken
+        }
+      });
+    }
+
+    const files = data.list.map(file => ({
+      name: file.server_filename,
+      size: file.size,
+      thumbnail: file.thumb,
+      download: file.dlink
+    }));
+
+    return res.json({
+      success: true,
+      count: files.length,
+      files
+    });
+
+  } catch (err) {
     return res.status(500).json({
       success: false,
-      message: error.message
+      message: err.message
     });
   }
 }
