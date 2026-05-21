@@ -1,9 +1,14 @@
-const express = require('express');
-const cors = require('cors');
-const { getDownloadLink } = require('terabox-api');
+import express from 'express';
+import cors from 'cors';
+import { getDownloadLink } from 'terabox-api';
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
+app.get('/', (req, res) => {
+    res.send('Terabox API Server is running successfully!');
+});
 
 app.get('/api/download', async (req, res) => {
     const { url } = req.query;
@@ -17,4 +22,5 @@ app.get('/api/download', async (req, res) => {
     }
 });
 
-module.exports = app;
+// Vercel serverless ke liye bina module.exports ke seedha default export chalega
+export default app;
