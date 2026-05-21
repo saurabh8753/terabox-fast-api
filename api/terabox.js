@@ -1,17 +1,20 @@
-const { Terabox } = require("terabox-api");
-
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
   try {
-    const url = req.query.url;
+    const { url } = req.query;
 
     if (!url) {
       return res.status(400).json({
         success: false,
-        message: "Missing URL"
+        message: "Missing URL parameter"
       });
     }
+
+    // ESM import
+    const module = await import("terabox-api");
+
+    const Terabox = module.Terabox || module.default;
 
     const terabox = new Terabox();
 
