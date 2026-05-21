@@ -1,6 +1,7 @@
 {
-  "name": "terabox-api",
+  "name": "terabox-fast-api",
   "version": "1.0.0",
+  "type": "module",
   "dependencies": {
     "terabox-api": "^1.0.0"
   }
