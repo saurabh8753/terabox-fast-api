@@ -1,38 +1,31 @@
 const { Terabox } = require("terabox-api");
 
-module.exports = async (req, res) => {
-  // CORS
+export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
 
   try {
-    const { url } = req.query;
+    const url = req.query.url;
 
     if (!url) {
       return res.status(400).json({
         success: false,
-        message: "Missing ?url= parameter"
+        message: "Missing URL"
       });
     }
 
     const terabox = new Terabox();
 
-    // Share link se data fetch
     const data = await terabox.getDownloadLink(url);
 
     return res.status(200).json({
       success: true,
-      result: data
+      data
     });
-  } catch (error) {
+
+  } catch (err) {
     return res.status(500).json({
       success: false,
-      message: error.message || "Internal Server Error"
+      error: err.message
     });
   }
-};
+}
