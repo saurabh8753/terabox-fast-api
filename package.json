@@ -2,6 +2,7 @@
   "name": "terabox-fast-api",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module", // <--- Yeh line add karni hai
   "scripts": {
     "start": "node index.js"
   },
