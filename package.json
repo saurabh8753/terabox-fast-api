@@ -1,5 +1,5 @@
 {
-  "name": "my-terabox-api",
+  "name": "terabox-fast-api",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
