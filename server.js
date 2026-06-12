@@ -56,7 +56,8 @@ function getFileType(name) {
 // ─── Core: resolve share via your existing worker ────────────────────────────
 // Worker already handles TeraBox auth — no bot detection on Cloudflare IPs
 async function resolveShare(surl, pwd = "") {
-  const params = new URLSearchParams({ mode: "resolve", surl, raw: "1" });
+  // force=1 bypasses D1 cache — ensures live response with dlink in each file
+  const params = new URLSearchParams({ mode: "resolve", surl, raw: "1", force: "1" });
   if (pwd) params.set("pwd", pwd);
 
   const res = await fetch(`${WORKER_BASE}/?${params}`, {
@@ -68,23 +69,47 @@ async function resolveShare(surl, pwd = "") {
   const json = await res.json();
   if (json.error) throw new Error(json.error);
 
-  // Worker returns either:
-  // {source:"live", upstream:{...terabox list response...}}
-  // {source:"d1",   data:{uk, shareid, list:[...]}}
   let list = [];
   let uk = "", shareid = "";
 
   if (json.upstream) {
-    // Live format
+    // Live format: {source:"live", upstream:{uk, shareid, list:[{dlink,...}]}}
     const up = json.upstream;
     uk = String(up.uk || up.share_uk || "");
     shareid = String(up.shareid || "");
     list = up.list || [];
   } else if (json.data?.list) {
-    // D1 cached format
-    uk = String(json.data.uk || "");
-    shareid = String(json.data.shareid || "");
-    list = json.data.list || [];
+    // D1 cached format: {source:"d1", data:{uk, shareid, list:[{dlink,...}]}}
+    const d = json.data;
+    uk = String(d.uk || "");
+    shareid = String(d.shareid || "");
+    list = d.list || [];
+
+    // If dlink missing from D1 cache, extract shareid from thumbnail surl
+    if (list.length && !list[0].dlink) {
+      // Try to get shareid from thumbnail URL: ?mode=thumbnail&fid=XXX&surl=SHAREID
+      const thumb = list[0]?.thumbs?.url3 || list[0]?.thumbs?.url1 || "";
+      if (!shareid && thumb) {
+        const surlMatch = thumb.match(/surl=([^&]+)/);
+        if (surlMatch) shareid = surlMatch[1];
+      }
+      // No dlink in cache — need fresh resolve without cache
+      // Retry without force param but with nocache header
+      const params2 = new URLSearchParams({ mode: "resolve", surl, raw: "1", nocache: "1" });
+      if (pwd) params2.set("pwd", pwd);
+      const res2 = await fetch(`${WORKER_BASE}/?${params2}`, {
+        headers: { "User-Agent": USER_AGENT, "Cache-Control": "no-cache" },
+      });
+      if (res2.ok) {
+        const json2 = await res2.json();
+        const up2 = json2.upstream || json2.data;
+        if (up2?.list?.length && up2.list[0].dlink) {
+          list = up2.list;
+          uk = String(up2.uk || uk);
+          shareid = String(up2.shareid || shareid);
+        }
+      }
+    }
   } else {
     throw new Error("Unexpected worker response format");
   }
@@ -93,19 +118,31 @@ async function resolveShare(surl, pwd = "") {
 }
 
 // ─── Get fresh dlink for a specific file via worker ──────────────────────────
-// Worker's mode=resolve fetches a brand new dlink each time (called on-demand)
 async function getFreshDlink(surl, fsid, pwd = "") {
-  // Re-resolve to get fresh dlink — worker fetches new signed URL every call
   const { list } = await resolveShare(surl, pwd);
 
   const file = fsid
     ? list.find((f) => String(f.fs_id) === String(fsid))
-    : list.find((f) => !f.isdir) || list[0];
+    : list.find((f) => f.isdir !== "1" && f.isdir !== 1) || list[0];
 
   if (!file) throw new Error("File not found in share");
-  if (!file.dlink) throw new Error("No dlink in worker response");
 
-  return { dlink: file.dlink, file };
+  // If dlink present — use it directly
+  if (file.dlink) return { dlink: file.dlink, file };
+
+  // dlink missing (D1 cache doesn't store it) — try mode=segment to get CDN URL
+  // mode=segment proxies the dlink, so we use it as the download URL directly
+  const fid = String(file.fs_id);
+  const surlParam = surl;
+  const segmentUrl = `${WORKER_BASE}/?mode=segment&fid=${fid}&surl=${surlParam}`;
+
+  // Verify it's reachable (HEAD request)
+  const probe = await fetch(segmentUrl, { method: "HEAD", headers: { "User-Agent": USER_AGENT } });
+  if (probe.ok || probe.status === 206) {
+    return { dlink: segmentUrl, file };
+  }
+
+  throw new Error("Could not get download link — dlink missing and segment fallback failed");
 }
 
 // ─── Middleware ───────────────────────────────────────────────────────────────
