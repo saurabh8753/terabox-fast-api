@@ -6,29 +6,41 @@ const rateLimit = require("express-rate-limit");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Constants (same as Trauso) ────────────────────────────────────────────
-const HNN_BASE = "https://terabox.hnn.workers.dev";
+// ─── Constants ──────────────────────────────────────────────────────────────
 const USER_AGENT =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-const HNN_HEADERS = {
-  Accept: "*/*",
-  "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
-  "Cache-Control": "no-cache",
-  Pragma: "no-cache",
-  "Sec-Fetch-Site": "same-origin",
-  "Sec-Fetch-Mode": "cors",
-  "Sec-Fetch-Dest": "empty",
-  "sec-ch-ua": `"Google Chrome";v="143", "Chromium";v="143", "Not A(Brand";v="24"`,
-  "sec-ch-ua-mobile": "?0",
-  "sec-ch-ua-platform": `"Windows"`,
-  Priority: "u=1, i",
-  Referer: `${HNN_BASE}/`,
-  Origin: HNN_BASE,
+const TERABOX_HEADERS = {
   "User-Agent": USER_AGENT,
+  Accept: "application/json, text/plain, */*",
+  "Accept-Language": "en-US,en;q=0.9",
+  Referer: "https://www.terabox.com/",
+  Origin: "https://www.terabox.com",
 };
 
-// ─── Supported URL patterns (same as Trauso) ───────────────────────────────
+// Cookie from env (ndus=xxx format or just value)
+function getCookies() {
+  const raw = process.env.TERABOX_COOKIE || "";
+  if (!raw) return {};
+  // Support both "ndus=xxx" and plain value
+  if (raw.includes("=")) {
+    const obj = {};
+    raw.split(";").forEach((pair) => {
+      const [k, ...v] = pair.trim().split("=");
+      if (k) obj[k.trim()] = v.join("=").trim();
+    });
+    return obj;
+  }
+  return { ndus: raw };
+}
+
+function cookieString() {
+  return Object.entries(getCookies())
+    .map(([k, v]) => `${k}=${v}`)
+    .join("; ");
+}
+
+// ─── URL helpers ─────────────────────────────────────────────────────────────
 const SHORTURL_PATTERNS = [
   /terabox\.com\/s\/([^/?&]+)/,
   /1024tera\.com\/s\/([^/?&]+)/,
@@ -45,9 +57,9 @@ const SHORTURL_PATTERNS = [
 const SHORTURL_DIRECT = /^[a-zA-Z0-9_-]{10,25}$/;
 
 function extractShorturl(url) {
-  for (const pattern of SHORTURL_PATTERNS) {
-    const match = url.match(pattern);
-    if (match) return match[1];
+  for (const p of SHORTURL_PATTERNS) {
+    const m = url.match(p);
+    if (m) return m[1];
   }
   if (SHORTURL_DIRECT.test(url)) return url;
   return null;
@@ -62,265 +74,297 @@ function formatBytes(bytes) {
 }
 
 function getFileType(name) {
-  const n = name.toLowerCase();
+  const n = (name || "").toLowerCase();
   if ([".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".3gp", ".flv"].some((e) => n.endsWith(e))) return "video";
-  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg"].some((e) => n.endsWith(e))) return "image";
-  if ([".pdf", ".docx", ".doc", ".xlsx", ".zip", ".rar", ".7z"].some((e) => n.endsWith(e))) return "file";
+  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp"].some((e) => n.endsWith(e))) return "image";
+  if ([".mp3", ".aac", ".wav", ".flac", ".ogg", ".m4a"].some((e) => n.endsWith(e))) return "audio";
+  if ([".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".txt"].some((e) => n.endsWith(e))) return "document";
+  if ([".zip", ".rar", ".7z", ".tar", ".gz"].some((e) => n.endsWith(e))) return "archive";
   return "other";
 }
 
-// ─── Middleware ────────────────────────────────────────────────────────────
+// ─── Step 1: Get jsToken + bdstoken from TeraBox share page ──────────────────
+async function getTokens(surl) {
+  const url = `https://www.terabox.com/sharing/link?surl=${surl}`;
+  const res = await fetch(url, {
+    headers: {
+      ...TERABOX_HEADERS,
+      Cookie: cookieString(),
+    },
+    redirect: "follow",
+  });
+  const html = await res.text();
+
+  const jsTokenMatch = html.match(/window\.jsToken\s*=\s*["']([^"']+)["']/);
+  const bdstokenMatch = html.match(/bdstoken["']?\s*[:=]\s*["']([^"']+)["']/);
+  const logidMatch = html.match(/dp-logid["']?\s*[:=]\s*["']([^"']+)["']/);
+
+  return {
+    jsToken: jsTokenMatch ? jsTokenMatch[1] : null,
+    bdstoken: bdstokenMatch ? bdstokenMatch[1] : null,
+    logid: logidMatch ? logidMatch[1] : null,
+  };
+}
+
+// ─── Step 2: Get share file list ─────────────────────────────────────────────
+async function getShareList(surl, pwd = "") {
+  // First try without tokens (public shares)
+  const params = new URLSearchParams({
+    app_id: "250528",
+    shorturl: surl,
+    root: "1",
+    ...(pwd ? { pwd } : {}),
+  });
+
+  const res = await fetch(
+    `https://www.terabox.com/api/shorturlinfo?${params}`,
+    {
+      headers: {
+        ...TERABOX_HEADERS,
+        Cookie: cookieString(),
+      },
+    }
+  );
+
+  if (!res.ok) throw new Error(`HTTP ${res.status} from shorturlinfo`);
+  const data = await res.json();
+
+  if (data.errno !== 0) {
+    // Try alternate endpoint
+    const params2 = new URLSearchParams({
+      app_id: "250528",
+      shorturl: surl,
+      root: "1",
+      channel: "dubox",
+      web: "1",
+      ...(pwd ? { pwd } : {}),
+    });
+
+    const res2 = await fetch(
+      `https://www.1024tera.com/api/shorturlinfo?${params2}`,
+      { headers: TERABOX_HEADERS }
+    );
+    if (!res2.ok) throw new Error(`HTTP ${res2.status} from 1024tera shorturlinfo`);
+    const data2 = await res2.json();
+    if (data2.errno !== 0) throw new Error(`TeraBox errno ${data2.errno}: ${data2.errmsg || "Unknown error"}`);
+    return data2;
+  }
+
+  return data;
+}
+
+// ─── Step 3: Get fresh dlink via filemetas ───────────────────────────────────
+async function getFreshDlink({ fsid, uk, shareid, sign, timestamp }) {
+  const params = new URLSearchParams({
+    app_id: "250528",
+    fsids: `[${fsid}]`,
+    dlink: "1",
+    uk: String(uk),
+    shareid: String(shareid),
+    sign: String(sign),
+    timestamp: String(timestamp),
+    channel: "dubox",
+    web: "1",
+  });
+
+  const res = await fetch(
+    `https://www.terabox.com/api/filemetas?${params}`,
+    {
+      headers: {
+        ...TERABOX_HEADERS,
+        Cookie: cookieString(),
+      },
+    }
+  );
+
+  if (!res.ok) throw new Error(`HTTP ${res.status} from filemetas`);
+  const data = await res.json();
+
+  if (data.errno !== 0) throw new Error(`filemetas errno ${data.errno}`);
+  const dlink = data.info?.[0]?.dlink;
+  if (!dlink) throw new Error("No dlink in filemetas response");
+  return dlink;
+}
+
+// ─── Middleware ───────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
+app.use(
+  rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    message: { status: "error", message: "Too many requests" },
+  })
+);
 
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 min
-  max: 30,
-  message: { status: "error", message: "Too many requests, slow down." },
-});
-app.use(limiter);
-
-// ─── Step 1: Get file info (shareid, uk, sign, timestamp, file list) ───────
-async function getInfo(shorturl) {
-  const endpoints = ["/api/get-info-new", "/api/get-info"];
-  let lastError = "Unknown error";
-
-  for (const endpoint of endpoints) {
-    try {
-      const url = `${HNN_BASE}${endpoint}?shorturl=${encodeURIComponent(shorturl)}&pwd=`;
-      const res = await fetch(url, { headers: HNN_HEADERS });
-
-      if (!res.ok) {
-        lastError = `HTTP ${res.status} from ${endpoint}`;
-        continue;
-      }
-
-      const data = await res.json();
-
-      if (data.ok) {
-        return {
-          ok: true,
-          shareid: data.shareid,
-          uk: data.uk,
-          sign: data.sign,
-          timestamp: data.timestamp,
-          title: data.title || "",
-          list: (data.list || []).map((item) => ({
-            fs_id: String(item.fs_id),
-            name: item.filename,
-            size: parseInt(item.size) || 0,
-            size_formatted: formatBytes(parseInt(item.size) || 0),
-            is_dir: item.is_dir === "1" || item.is_dir === 1,
-            file_type: getFileType(item.filename),
-            category: item.category || null,
-            create_time: item.create_time ? parseInt(item.create_time) : null,
-          })),
-        };
-      }
-
-      lastError = data.message || `${endpoint} returned ok=false`;
-    } catch (e) {
-      lastError = `${endpoint} error: ${e.message}`;
-    }
-  }
-
-  return { ok: false, message: lastError };
-}
-
-// ─── Step 2: Get fresh download link (POST to hnn) ─────────────────────────
-async function getDownloadLink({ shareid, uk, sign, timestamp, fs_id, mode = 2 }) {
-  // mode 1 = get-download first, mode 2 = get-downloadp first (more stable)
-  const order =
-    mode === 1
-      ? ["/api/get-download", "/api/get-downloadp"]
-      : ["/api/get-downloadp", "/api/get-download"];
-
-  let lastError = "Unknown error";
-
-  for (const endpoint of order) {
-    try {
-      const res = await fetch(`${HNN_BASE}${endpoint}`, {
-        method: "POST",
-        headers: { ...HNN_HEADERS, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          shareid: Number(shareid),
-          uk: Number(uk),
-          sign: String(sign),
-          timestamp: Number(timestamp),
-          fs_id: String(fs_id),
-        }),
-      });
-
-      const data = await res.json();
-
-      if (data.ok && data.downloadLink) {
-        return { ok: true, download_link: data.downloadLink };
-      }
-
-      lastError = data.message || `${endpoint} returned ok=false`;
-    } catch (e) {
-      lastError = `${endpoint} error: ${e.message}`;
-    }
-  }
-
-  return { ok: false, message: lastError };
-}
-
-// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 //  ROUTES
-// ══════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 
 // GET /info?url=...
-// Returns: file list + shareid/uk/sign/timestamp needed for /download
 app.get("/info", async (req, res) => {
-  const { url } = req.query;
-  if (!url) return res.status(400).json({ status: "error", message: "Missing ?url= parameter" });
+  const { url, pwd } = req.query;
+  if (!url) return res.status(400).json({ status: "error", message: "Missing ?url=" });
 
-  const shorturl = extractShorturl(url);
-  if (!shorturl) return res.status(400).json({ status: "error", message: "Invalid TeraBox URL" });
+  const surl = extractShorturl(url);
+  if (!surl) return res.status(400).json({ status: "error", message: "Invalid TeraBox URL" });
 
   const start = Date.now();
-  const result = await getInfo(shorturl);
+  try {
+    const data = await getShareList(surl, pwd || "");
 
-  if (!result.ok) {
-    return res.status(502).json({ status: "error", message: result.message });
+    const ukVal = data.uk || data.share_uk;
+    const shareidVal = data.shareid;
+    const signVal = data.sign;
+    const timestampVal = data.timestamp;
+
+    const files = (data.list || []).map((item) => ({
+      fs_id: String(item.fs_id),
+      name: item.server_filename,
+      size: parseInt(item.size) || 0,
+      size_formatted: formatBytes(parseInt(item.size) || 0),
+      is_dir: item.isdir === "1" || item.isdir === 1,
+      file_type: getFileType(item.server_filename),
+      thumbnail: item.thumbs?.url3 || item.thumbs?.url1 || "",
+      create_time: item.server_ctime || null,
+    }));
+
+    return res.json({
+      status: "success",
+      response_time: `${((Date.now() - start) / 1000).toFixed(3)}s`,
+      shorturl: surl,
+      title: data.title || "",
+      uk: ukVal,
+      shareid: shareidVal,
+      sign: signVal,
+      timestamp: timestampVal,
+      total_files: files.length,
+      files,
+    });
+  } catch (e) {
+    return res.status(502).json({ status: "error", message: e.message });
   }
-
-  return res.json({
-    status: "success",
-    response_time: `${((Date.now() - start) / 1000).toFixed(3)}s`,
-    shorturl,
-    title: result.title,
-    shareid: result.shareid,
-    uk: result.uk,
-    sign: result.sign,
-    timestamp: result.timestamp,
-    total_files: result.list.length,
-    files: result.list,
-  });
-});
-
-// GET /download?url=...&fsid=...
-// One-shot: info + download link in single call, then 302 redirect
-app.get("/download", async (req, res) => {
-  const { url, fsid, mode } = req.query;
-  if (!url) return res.status(400).json({ status: "error", message: "Missing ?url= parameter" });
-
-  const shorturl = extractShorturl(url);
-  if (!shorturl) return res.status(400).json({ status: "error", message: "Invalid TeraBox URL" });
-
-  // Step 1: get info
-  const info = await getInfo(shorturl);
-  if (!info.ok) return res.status(502).json({ status: "error", message: info.message });
-
-  // Pick file — fsid param se ya first file
-  const targetFile = fsid
-    ? info.list.find((f) => f.fs_id === String(fsid))
-    : info.list[0];
-
-  if (!targetFile) return res.status(404).json({ status: "error", message: "File not found" });
-  if (targetFile.is_dir) return res.status(400).json({ status: "error", message: "Target is a folder, use /info to list files" });
-
-  // Step 2: get fresh download link
-  const linkResult = await getDownloadLink({
-    shareid: info.shareid,
-    uk: info.uk,
-    sign: info.sign,
-    timestamp: info.timestamp,
-    fs_id: targetFile.fs_id,
-    mode: mode ? parseInt(mode) : 2,
-  });
-
-  if (!linkResult.ok) return res.status(502).json({ status: "error", message: linkResult.message });
-
-  // 302 redirect — browser directly hits CDN, no buffering
-  return res.redirect(302, linkResult.download_link);
 });
 
 // GET /link?url=...&fsid=...
-// Same as /download but returns JSON (for apps/frontend)
+// Returns fresh download link as JSON
 app.get("/link", async (req, res) => {
-  const { url, fsid, mode } = req.query;
-  if (!url) return res.status(400).json({ status: "error", message: "Missing ?url= parameter" });
+  const { url, fsid, pwd } = req.query;
+  if (!url) return res.status(400).json({ status: "error", message: "Missing ?url=" });
 
-  const shorturl = extractShorturl(url);
-  if (!shorturl) return res.status(400).json({ status: "error", message: "Invalid TeraBox URL" });
+  const surl = extractShorturl(url);
+  if (!surl) return res.status(400).json({ status: "error", message: "Invalid TeraBox URL" });
 
   const start = Date.now();
+  try {
+    // Step 1: get share info
+    const data = await getShareList(surl, pwd || "");
+    const uk = data.uk || data.share_uk;
+    const shareid = data.shareid;
+    const sign = data.sign;
+    const timestamp = data.timestamp;
 
-  const info = await getInfo(shorturl);
-  if (!info.ok) return res.status(502).json({ status: "error", message: info.message });
+    // Pick file
+    const list = data.list || [];
+    const targetFile = fsid
+      ? list.find((f) => String(f.fs_id) === String(fsid))
+      : list.find((f) => f.isdir !== "1" && f.isdir !== 1) || list[0];
 
-  const targetFile = fsid
-    ? info.list.find((f) => f.fs_id === String(fsid))
-    : info.list[0];
+    if (!targetFile) return res.status(404).json({ status: "error", message: "File not found" });
 
-  if (!targetFile) return res.status(404).json({ status: "error", message: "File not found" });
+    // Step 2: get fresh dlink
+    const dlink = await getFreshDlink({
+      fsid: targetFile.fs_id,
+      uk,
+      shareid,
+      sign,
+      timestamp,
+    });
 
-  const linkResult = await getDownloadLink({
-    shareid: info.shareid,
-    uk: info.uk,
-    sign: info.sign,
-    timestamp: info.timestamp,
-    fs_id: targetFile.fs_id,
-    mode: mode ? parseInt(mode) : 2,
-  });
-
-  if (!linkResult.ok) return res.status(502).json({ status: "error", message: linkResult.message });
-
-  return res.json({
-    status: "success",
-    response_time: `${((Date.now() - start) / 1000).toFixed(3)}s`,
-    filename: targetFile.name,
-    size: targetFile.size_formatted,
-    size_bytes: targetFile.size,
-    file_type: targetFile.file_type,
-    download_link: linkResult.download_link,
-  });
+    return res.json({
+      status: "success",
+      response_time: `${((Date.now() - start) / 1000).toFixed(3)}s`,
+      filename: targetFile.server_filename,
+      size: formatBytes(parseInt(targetFile.size) || 0),
+      size_bytes: parseInt(targetFile.size) || 0,
+      file_type: getFileType(targetFile.server_filename),
+      download_link: dlink,
+    });
+  } catch (e) {
+    return res.status(502).json({ status: "error", message: e.message });
+  }
 });
 
-// POST /get-download-link
-// Direct: accepts shareid/uk/sign/timestamp/fs_id, returns fresh link
-app.post("/get-download-link", async (req, res) => {
-  const { shareid, uk, sign, timestamp, fs_id, mode } = req.body;
+// GET /download?url=...&fsid=...
+// 302 redirect to direct CDN download — no buffering
+app.get("/download", async (req, res) => {
+  const { url, fsid, pwd } = req.query;
+  if (!url) return res.status(400).json({ status: "error", message: "Missing ?url=" });
 
-  if (!shareid || !uk || !sign || !timestamp || !fs_id) {
-    return res.status(400).json({
-      status: "error",
-      message: "Missing required fields: shareid, uk, sign, timestamp, fs_id",
+  const surl = extractShorturl(url);
+  if (!surl) return res.status(400).json({ status: "error", message: "Invalid TeraBox URL" });
+
+  try {
+    const data = await getShareList(surl, pwd || "");
+    const uk = data.uk || data.share_uk;
+    const shareid = data.shareid;
+    const sign = data.sign;
+    const timestamp = data.timestamp;
+
+    const list = data.list || [];
+    const targetFile = fsid
+      ? list.find((f) => String(f.fs_id) === String(fsid))
+      : list.find((f) => f.isdir !== "1" && f.isdir !== 1) || list[0];
+
+    if (!targetFile) return res.status(404).json({ status: "error", message: "File not found" });
+
+    const dlink = await getFreshDlink({
+      fsid: targetFile.fs_id,
+      uk,
+      shareid,
+      sign,
+      timestamp,
     });
+
+    // Direct redirect — browser hits TeraBox CDN directly
+    return res.redirect(302, dlink);
+  } catch (e) {
+    return res.status(502).json({ status: "error", message: e.message });
   }
-
-  const result = await getDownloadLink({ shareid, uk, sign, timestamp, fs_id, mode });
-
-  if (!result.ok) return res.status(502).json({ status: "error", message: result.message });
-
-  return res.json({ status: "success", download_link: result.download_link });
 });
 
 // GET /health
-app.get("/health", (_, res) => res.json({ status: "ok", timestamp: new Date().toISOString() }));
+app.get("/health", (_, res) =>
+  res.json({ status: "ok", timestamp: new Date().toISOString() })
+);
 
-// GET / — API docs
-app.get("/", (_, res) => {
+// GET /
+app.get("/", (_, res) =>
   res.json({
     name: "TeraBox API",
-    version: "1.0.0",
+    version: "2.0.0",
+    note: "Direct TeraBox API — no third-party worker dependency",
     endpoints: {
-      "GET /info?url=TERABOX_URL": "Get file list + metadata",
-      "GET /link?url=TERABOX_URL&fsid=FS_ID": "Get direct download link (JSON)",
-      "GET /download?url=TERABOX_URL&fsid=FS_ID": "Download redirect (302)",
-      "POST /get-download-link": "Get fresh link with shareid/uk/sign/timestamp/fs_id",
+      "GET /info?url=TERABOX_URL": "File list + metadata",
+      "GET /link?url=TERABOX_URL&fsid=FS_ID": "Fresh download link (JSON)",
+      "GET /download?url=TERABOX_URL&fsid=FS_ID": "Direct download (302 redirect)",
       "GET /health": "Health check",
     },
-    notes: {
-      fsid: "Optional. If omitted, first file is used.",
-      mode: "1 or 2 (default 2). Download server preference.",
+    optional_params: {
+      fsid: "Specific file fs_id. Omit to use first file.",
+      pwd: "Password for protected shares.",
     },
-  });
-});
+    env: {
+      TERABOX_COOKIE: "Your ndus cookie value (required for filemetas)",
+      PORT: "Server port (default 3000)",
+    },
+  })
+);
 
-// ─── Start ─────────────────────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`TeraBox API running on http://localhost:${PORT}`);
+  console.log(`TeraBox API v2 running on http://localhost:${PORT}`);
+  if (!process.env.TERABOX_COOKIE) {
+    console.warn("WARNING: TERABOX_COOKIE not set — filemetas may fail for some files");
+  }
 });
